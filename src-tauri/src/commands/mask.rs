@@ -29,7 +29,7 @@ pub async fn confirm(
     webview: Webview,
     window: Window,
     state: State<'_, Confirmations>,
-    control: State<crate::control::ControlState>,
+    control: State<'_, crate::control::ControlState>,
     message: String,
     options: Option<ConfirmOptions>,
 ) -> CommandsResult<bool> {
