@@ -57,6 +57,47 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8765/stop
 ```
 
+## 构建与运行踩坑（务必核对）
+
+1. **必须用官方打包链路构建**：`pnpm tauri build --no-bundle`。
+   直接 `cargo build --release` 不会执行 `beforeBuildCommand`，前端资源（`dist/`）可能是旧的/不全，
+   结果是主界面 WebView 根本不加载（启动日志里没有 `成功获取 AI Provider 列表`、`成功获取配置信息`、
+   也没有 `asset not found: favicon.ico` 请求），窗口不会被 show，紧接着**所有 media 元素恒为
+   `readyState=0`**（真实课程视频、data:URL 视频、WAV 都不解码），脚本流程也会在配置加载后静默停住。
+   产物大小参考：约 13,060,000 字节；若只有 10MB 左右说明前端资源没打进去。
+2. **确认框必须走 `chaoxing-mask` 的自动裁决**：`commands/mask.rs` 的 `confirm` 只允许 `main` / `chaoxing`
+   两个 WebView 发起，课程页走 `chaoxing-mask` 分支。这里必须插入：
+   ```rust
+   if mask_label == "chaoxing-mask" {
+       if let Some(choice) = window.app_handle()
+           .state::<crate::control::ControlState>()
+           .auto_confirm()
+       {
+           log::info!("远程控制自动确认课程确认框: {choice}");
+           return Ok(choice);
+       }
+   }
+   ```
+   该逻辑一旦丢失（例如 `git checkout src-tauri/src` 把 `mask.rs` 还原成上游版本），`/start` 之后
+   确认框会在后台等待一个永远不存在的点击，脚本挂死：日志停在 `配置设置成功` 之后，`/status` 的
+   `courseActive` 恒为 `false`，从页面 `invoke("confirm", ...)` 探针会立刻返回 `false`（`try_lock` 失败，
+   说明上一次确认还挂着）。**重编前先确认 `mask.rs` 里还有这段**。
+3. **`/start` 会重载页面**：重载瞬间 WebView2 会打印 `IPC custom protocol failed... Couldn't find callback id`，
+   属正常噪声；但如果之后 30 秒内没有出现 `获取课程列表成功，共 N 个章节`，就是流程没起来，需重启客户端再 `/start`。
+4. **补刷用课程树判定，不要靠日志**：注入了 `SELECTORS.courseTree`（`div.posCatalog_select` +
+   `span.posCatalog_name`，未完成标记 `:has(.orangeNew)`、未完成数量 `input.jobUnfinishCount`）。
+   核对时在 chaoxing 页面执行：
+   ```js
+   { total: document.querySelectorAll("div.posCatalog_select").length,
+     unfinished: document.querySelectorAll("div.posCatalog_select:has(.orangeNew)").length }
+   ```
+   `unfinished > 0` 就重新 `/start`（脚本普通模式只处理未完成章节，会跳过已完成的）。
+5. **观看时长任务点会掉回 1 倍速**：`injected/chaoxing/course/chapter/tasks.js` 检测到任务点带“观看时长”
+   条件时执行 `config.lockSpeed = null` 并打印 `有观看时长要求，关闭后续倍速锁定`。这是上游防判无效的
+   设计，不要手动调回 2x（上报时长不足容易被判学习时长不足）。
+6. **长时间无人值守**：客户端在跑时用 `SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED)`
+   的守护进程可以只防睡眠、不拦熄屏；客户端退出后让它自行结束（见 `scripts/keepawake.ps1` 或临时脚本）。
+
 ## 从外网访问
 
 默认只监听回环地址，外部无法直连。推荐两种方式（任选其一，都必须保留令牌校验）：
