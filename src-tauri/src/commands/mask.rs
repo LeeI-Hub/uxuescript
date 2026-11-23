@@ -37,6 +37,18 @@ pub async fn confirm(
         "chaoxing" => ("chaoxing-mask", &state.1),
         _ => return Err(anyhow!("此 Webview 不能发起确认弹窗").into()),
     };
+
+    // 远程控制：课程页发起的确认框按 ControlState 策略直接裁决，避免无人值守时挂死。
+    if mask_label == "chaoxing-mask" {
+        if let Some(choice) = window
+            .app_handle()
+            .state::<crate::control::ControlState>()
+            .auto_confirm()
+        {
+            log::info!("远程控制自动确认课程确认框: {choice}");
+            return Ok(choice);
+        }
+    }
     let Ok(_active) = active.try_lock() else {
         return Ok(false);
     };
