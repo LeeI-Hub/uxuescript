@@ -29,7 +29,6 @@ pub async fn confirm(
     webview: Webview,
     window: Window,
     state: State<'_, Confirmations>,
-    control: State<'_, crate::control::ControlState>,
     message: String,
     options: Option<ConfirmOptions>,
 ) -> CommandsResult<bool> {
@@ -38,13 +37,6 @@ pub async fn confirm(
         "chaoxing" => ("chaoxing-mask", &state.1),
         _ => return Err(anyhow!("此 Webview 不能发起确认弹窗").into()),
     };
-    // 远程控制启动/停止课程时跳过遮罩，避免必须有人点按钮。
-    if webview.label() == "chaoxing" {
-        if let Some(choice) = control.auto_confirm() {
-            log::info!("远程控制自动{}课程确认框", if choice { "确认" } else { "取消" });
-            return Ok(choice);
-        }
-    }
     let Ok(_active) = active.try_lock() else {
         return Ok(false);
     };

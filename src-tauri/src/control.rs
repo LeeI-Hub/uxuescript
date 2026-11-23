@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -38,12 +38,25 @@ const CONFIRM_WINDOW: u64 = 15;
 #[derive(Default)]
 pub struct ControlState {
     confirm_mode: AtomicU8,
+    /// 持久化模式：为真时不会再被启动/停止后的定时器重置回界面确认。
+    confirm_persistent: AtomicBool,
     last_status: Mutex<Option<Value>>,
 }
 
 impl ControlState {
     pub fn set_confirm(&self, mode: u8) {
         self.confirm_mode.store(mode, Ordering::SeqCst);
+    }
+
+    /// 设置持久化确认策略；`ask` 表示交还界面。
+    pub fn set_confirm_persistent(&self, mode: u8) {
+        self.confirm_mode.store(mode, Ordering::SeqCst);
+        self.confirm_persistent
+            .store(mode != CONFIRM_ASK, Ordering::SeqCst);
+    }
+
+    pub fn confirm_persistent(&self) -> bool {
+        self.confirm_persistent.load(Ordering::SeqCst)
     }
 
     pub fn confirm_mode(&self) -> u8 {
@@ -73,6 +86,26 @@ struct RemoteConfig {
     enabled: bool,
     addr: String,
     token: String,
+    /// 确认策略：`yes` / `no` / `ask`（缺省交给界面）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confirm: Option<String>,
+}
+
+/// 把配置里的确认策略字符串解析成内部模式值。
+fn parse_confirm(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("yes") | Some("true") | Some("1") => CONFIRM_YES,
+        Some("no") | Some("false") | Some("0") => CONFIRM_NO,
+        _ => CONFIRM_ASK,
+    }
+}
+
+fn confirm_name(mode: u8) -> &'static str {
+    match mode {
+        CONFIRM_YES => "yes",
+        CONFIRM_NO => "no",
+        _ => "ask",
+    }
 }
 
 impl Default for RemoteConfig {
@@ -89,6 +122,7 @@ impl Default for RemoteConfig {
             enabled: true,
             addr: "127.0.0.1:8765".to_owned(),
             token: format!("{:x}", md5::compute(seed.as_bytes())),
+            confirm: Some("yes".to_owned()),
         }
     }
 }
@@ -133,6 +167,11 @@ pub fn start(app: AppHandle) {
     if !config.enabled {
         log::info!("远程控制已停用（{}）", config_path().display());
         return;
+    }
+    let mode = parse_confirm(config.confirm.as_deref());
+    if mode != CONFIRM_ASK {
+        app.state::<ControlState>().set_confirm_persistent(mode);
+        log::info!("确认策略: {}", confirm_name(mode));
     }
     let addr: SocketAddr = match config.addr.parse() {
         Ok(addr) => addr,
@@ -312,21 +351,35 @@ fn status_value(app: &AppHandle) -> Value {
         "ok": true,
         "courseActive": course_active(app),
         "url": current_url(app),
-        "confirmMode": match control.confirm_mode() {
-            CONFIRM_YES => "yes",
-            CONFIRM_NO => "no",
-            _ => "ask",
-        },
+        "confirmMode": confirm_name(control.confirm_mode()),
+        "confirmPersistent": control.confirm_persistent(),
         "lastStatus": control.last_status(),
     })
 }
 
 /// 让自动确认策略只在短时间窗口内生效，随后交还界面。
+/// 写入确认策略到 remote.toml，供下次启动沿用。
+fn persist_confirm(mode: &str) -> Result<(), String> {
+    let path = config_path();
+    let mut config = load_config();
+    config.confirm = if mode == "ask" {
+        None
+    } else {
+        Some(mode.to_owned())
+    };
+    let text = toml::to_string(&config).map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| format!("写入 {} 失败: {error}", path.display()))
+}
+
 fn schedule_confirm_reset(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(CONFIRM_WINDOW)).await;
-        app.state::<ControlState>().set_confirm(CONFIRM_ASK);
+        let state = app.state::<ControlState>();
+        if state.confirm_persistent() {
+            return;
+        }
+        state.set_confirm(CONFIRM_ASK);
     });
 }
 
@@ -344,8 +397,15 @@ fn with_course_webview(
 
 /// 启动课程自动化：把当前/指定课程页重新加载，页面注入脚本后自动确认启动。
 fn start_course(app: &AppHandle, url: Option<String>) -> Result<Value, (u16, Value)> {
-    app.state::<ControlState>().set_confirm(CONFIRM_YES);
-    schedule_confirm_reset(app);
+    let control = app.state::<ControlState>();
+    let persistent = control.confirm_persistent();
+    if !persistent {
+        control.set_confirm(CONFIRM_YES);
+    }
+    drop(control);
+    if !persistent {
+        schedule_confirm_reset(app);
+    }
     let action = url.clone();
     with_course_webview(app, |webview| match action.as_ref() {
         Some(target) => {
@@ -370,8 +430,15 @@ fn start_course(app: &AppHandle, url: Option<String>) -> Result<Value, (u16, Val
 
 /// 停止课程自动化：清空任务会话并重载页面，重载后脚本会被自动取消。
 fn stop_course(app: &AppHandle) -> Result<Value, (u16, Value)> {
-    app.state::<ControlState>().set_confirm(CONFIRM_NO);
-    schedule_confirm_reset(app);
+    let control = app.state::<ControlState>();
+    let persistent = control.confirm_persistent();
+    if !persistent {
+        control.set_confirm(CONFIRM_NO);
+    }
+    drop(control);
+    if !persistent {
+        schedule_confirm_reset(app);
+    }
     app.state::<TaskSession>().clear();
     with_course_webview(app, |webview| {
         webview.eval("location.reload()")?;
@@ -436,6 +503,8 @@ async fn route(
                     "POST /navigate": "跳转 {\"url\": \"...\"}",
                     "POST /eval": "在 chaoxing 页面执行 {\"js\": \"...\"}",
                     "POST /solve": "解题 {\"payload\": Folio, \"allowPartial\": false}",
+                    "GET /autoconfirm": "查看确认策略",
+                    "POST /autoconfirm": "设置确认策略 {\"mode\": \"yes|no|ask\"}，持久生效",
                     "GET /logs?lines=N": "查看最新日志尾部"
                 },
                 "auth": "Authorization: Bearer <remote.toml 中的 token>"
@@ -472,6 +541,40 @@ async fn route(
 
     if path == "/stop" && request.method == "POST" {
         return stop_course(app).map(|value| (200, value));
+    }
+
+    if path == "/autoconfirm" && request.method == "GET" {
+        let control = app.state::<ControlState>();
+        return Ok((
+            200,
+            json!({
+                "ok": true,
+                "mode": confirm_name(control.confirm_mode()),
+                "persistent": control.confirm_persistent()
+            }),
+        ));
+    }
+
+    if path == "/autoconfirm" && request.method == "POST" {
+        let body = json_body(&request.body)?;
+        let mode = body
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or((400, json!({"error": "缺少 mode（yes/no/ask）"})))?
+            .to_owned();
+        let value = match mode.as_str() {
+            "yes" | "no" | "ask" => mode,
+            other => {
+                return Err((400, json!({"error": format!("未知的策略: {other}")})));
+            }
+        };
+        app.state::<ControlState>()
+            .set_confirm_persistent(parse_confirm(Some(value.as_str())));
+        if let Err(error) = persist_confirm(&value) {
+            return Err((500, json!({"error": error})));
+        }
+        log::info!("确认策略已设置为 {value}");
+        return Ok((200, json!({"ok": true, "mode": value, "persistent": value != "ask"})));
     }
 
     if path == "/reload" && request.method == "POST" {
