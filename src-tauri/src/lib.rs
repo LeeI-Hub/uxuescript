@@ -1,6 +1,7 @@
 pub mod app;
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod core;
 
 #[cfg(target_os = "macos")]
@@ -60,8 +61,13 @@ pub fn run() {
         .manage(TaskSession::default())
         .manage(Confirmations::default())
         .manage(DownloadState::default())
+        .manage(control::ControlState::default())
         .invoke_handler(uxs_commands::register!())
-        .setup(window::init)
+        .setup(|app| {
+            window::init(app)?;
+            control::start(app.handle().clone());
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

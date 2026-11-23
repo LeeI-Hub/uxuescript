@@ -107,8 +107,14 @@ pub fn course_automation(session: tauri::State<super::task::TaskSession>) -> boo
 }
 
 #[uxs_commands::command(webview = "chaoxing")]
-pub fn send_status(webview: tauri::Webview, status: CourseStatus) -> CommandsResult<()> {
+pub fn send_status(
+    webview: tauri::Webview,
+    status: CourseStatus,
+    control: tauri::State<crate::control::ControlState>,
+) -> CommandsResult<()> {
     use tauri::Manager;
+    // 远程控制层需要最近一次状态事件，用于 /status 轮询。
+    control.set_last_status(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null));
     match status {
         CourseStatus::Start(()) => webview.state::<super::task::TaskSession>().start_course(),
         CourseStatus::Cancel(()) | CourseStatus::Finish(()) => {

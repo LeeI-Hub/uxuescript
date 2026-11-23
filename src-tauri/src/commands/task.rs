@@ -53,6 +53,11 @@ impl TaskSession {
         *self.0.lock() = TaskData::default();
     }
 
+    /// 只读查询：当前会话是否正在推进课程自动化。
+    pub fn is_active(&self) -> bool {
+        self.0.lock().course_active
+    }
+
     pub fn start_course(&self) {
         self.0.lock().course_active = true;
     }
