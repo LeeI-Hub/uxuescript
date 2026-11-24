@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -41,11 +41,42 @@ pub struct ControlState {
     /// 持久化模式：为真时不会再被启动/停止后的定时器重置回界面确认。
     confirm_persistent: AtomicBool,
     last_status: Mutex<Option<Value>>,
+    /// 页面侧回传数据（`/report`，讨论自动化用）。
+    report: Mutex<Option<Value>>,
+    /// 本次讨论任务的一次性回传口令，避免任意网页调用 `/report`。
+    report_nonce: Mutex<String>,
+    /// 控制接口实际监听端口，供页面侧回传地址使用。
+    port: AtomicU16,
 }
 
 impl ControlState {
     pub fn set_confirm(&self, mode: u8) {
         self.confirm_mode.store(mode, Ordering::SeqCst);
+    }
+
+    pub fn set_report(&self, value: Value) {
+        *self.report.lock() = Some(value);
+    }
+
+    pub fn take_report(&self) -> Option<Value> {
+        self.report.lock().take()
+    }
+
+    pub fn set_report_nonce(&self, nonce: String) -> String {
+        *self.report_nonce.lock() = nonce.clone();
+        nonce
+    }
+
+    pub fn report_nonce(&self) -> String {
+        self.report_nonce.lock().clone()
+    }
+
+    pub fn set_port(&self, port: u16) {
+        self.port.store(port, Ordering::SeqCst);
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port.load(Ordering::SeqCst)
     }
 
     /// 设置持久化确认策略；`ask` 表示交还界面。
@@ -182,6 +213,7 @@ pub fn start(app: AppHandle) {
     };
     let token = config.token.clone();
     let path = config_path();
+    app.state::<ControlState>().set_port(addr.port());
 
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -447,8 +479,214 @@ fn stop_course(app: &AppHandle) -> Result<Value, (u16, Value)> {
     Ok(json!({"ok": true, "stopped": true}))
 }
 
-fn tail_lines(path: &std::path::Path, count: usize) -> std::io::Result<Vec<String>> {
-    let content = std::fs::read_to_string(path)?;
+/// 讨论任务点：从章节页取话题地址，再在话题页回帖完成。
+const EXTRACT_TOPIC_JS: &str = r##"(function () {
+  var out = { kind: "topic", chapterId: "__CHAPTER__", url: "", question: "", error: "" };
+  try {
+    var d1 = document.querySelector("#iframe").contentWindow.document;
+    var w1 = d1.querySelector("iframe").contentWindow;
+    var w2 = w1.document.getElementById("frame_content").contentWindow;
+    var div = w2.document.getElementById("topicMainDiv");
+    out.url = div ? div.getAttribute("data") : "";
+    out.question = (w2.document.body ? w2.document.body.innerText : "").replace(/\s+/g, " ").trim().slice(0, 200);
+  } catch (error) { out.error = String(error); }
+  try {
+    navigator.sendBeacon("http://127.0.0.1:__PORT__/report?nonce=__NONCE__", new Blob([JSON.stringify(out)], { type: "text/plain" }));
+  } catch (error) {}
+  return 1;
+})();"##;
+
+const REPLY_TOPIC_JS: &str = r##"(function () {
+  var out = { kind: "reply", chapterId: "__CHAPTER__", filled: false, clicked: false, ok: false, error: "" };
+  try {
+    var area = document.querySelector("textarea[placeholder='回复话题']");
+    if (area) {
+      area.value = __TEXT__;
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+      area.dispatchEvent(new Event("keyup", { bubbles: true }));
+      out.filled = true;
+    }
+    var button = document.querySelector(".addReply");
+    if (button) { button.click(); out.clicked = true; }
+  } catch (error) { out.error = String(error); }
+  setTimeout(function () {
+    try {
+      var text = document.body ? document.body.innerText : "";
+      out.ok = text.indexOf("刚刚") >= 0;
+    } catch (error) {}
+    try {
+      navigator.sendBeacon("http://127.0.0.1:__PORT__/report?nonce=__NONCE__", new Blob([JSON.stringify(out)], { type: "text/plain" }));
+    } catch (error) {}
+  }, 3000);
+  return 1;
+})();"##;
+
+fn make_nonce(seed: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{:x}", md5::compute(format!("{seed}-{nanos}").as_bytes()))
+}
+
+fn render_js(template: &str, chapter: &str, nonce: &str, port: u16, text: Option<&str>) -> String {
+    let mut script = template
+        .replace("__CHAPTER__", chapter)
+        .replace("__NONCE__", nonce)
+        .replace("__PORT__", &port.to_string());
+    if let Some(value) = text {
+        let literal = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned());
+        script = script.replace("__TEXT__", &literal);
+    }
+    script
+}
+
+async fn wait_report(
+    app: &AppHandle,
+    kind: &str,
+    chapter: &str,
+    tries: usize,
+) -> Result<Value, (u16, Value)> {
+    for _ in 0..tries {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Some(value) = app.state::<ControlState>().take_report() {
+            let same_kind = value.get("kind").and_then(Value::as_str) == Some(kind);
+            let same_chapter = value.get("chapterId").and_then(Value::as_str) == Some(chapter);
+            if same_kind && same_chapter {
+                return Ok(value);
+            }
+        }
+    }
+    Err((
+        500,
+        json!({
+            "error": format!("等待页面回传超时（{kind} / {chapter}）；页面可能未加载完成或不是章节页"),
+        }),
+    ))
+}
+
+/// 打开指定章节 → 读取讨论话题地址 → 在话题页回帖。
+async fn discuss_topic(app: &AppHandle, body: Value) -> Result<Value, (u16, Value)> {
+    let text_of = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let chapter = text_of("chapterId").ok_or((400, json!({"error": "缺少 chapterId"})))?;
+    let course = text_of("courseId").ok_or((400, json!({"error": "缺少 courseId"})))?;
+    let clazz = text_of("clazzId").ok_or((400, json!({"error": "缺少 clazzId"})))?;
+    let cpi = text_of("cpi").ok_or((400, json!({"error": "缺少 cpi"})))?;
+    let enc = text_of("enc").ok_or((400, json!({"error": "缺少 enc"})))?;
+    let text = text_of("text").ok_or((400, json!({"error": "缺少 text（回帖内容）"})))?;
+    let dry_run = body.get("dryRun").and_then(Value::as_bool).unwrap_or(false);
+    let wait = body
+        .get("waitSeconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(7)
+        .clamp(3, 20);
+
+    let state = app.state::<ControlState>();
+    let port = state.port();
+    let nonce = state.set_report_nonce(make_nonce(&chapter));
+    drop(state);
+
+    let chapter_url = format!(
+        "https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId={chapter}&courseId={course}&clazzid={clazz}&cpi={cpi}&enc={enc}&mooc2=1&hidetype=0&fanyaVersion=0"
+    );
+    {
+        let webview = app.get_webview("chaoxing").ok_or((
+            409,
+            json!({"error": "未找到 chaoxing Webview，请等待主界面初始化"}),
+        ))?;
+        let parsed: tauri::Url = chapter_url
+            .parse()
+            .map_err(|error| (500, json!({"error": format!("URL 无效: {error}")})))?;
+        webview
+            .navigate(parsed)
+            .map_err(|error| (500, json!({"error": format!("跳转失败: {error}")})))?;
+    }
+
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+
+    let script = render_js(EXTRACT_TOPIC_JS, &chapter, &nonce, port, None);
+    {
+        let webview = app.get_webview("chaoxing").ok_or((
+            409,
+            json!({"error": "未找到 chaoxing Webview"}),
+        ))?;
+        webview
+            .eval(&script)
+            .map_err(|error| (500, json!({"error": format!("执行脚本失败: {error}")})))?;
+    }
+
+    let topic = wait_report(app, "topic", &chapter, 40).await?;
+    let topic_url = topic
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let question = topic
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if topic_url.is_empty() {
+        return Err((
+            500,
+            json!({"error": "未取到讨论话题地址；该章节可能不是讨论任务点", "question": question}),
+        ));
+    }
+    if dry_run {
+        return Ok(json!({"ok": true, "dryRun": true, "topicUrl": topic_url, "question": question}));
+    }
+
+    {
+        let webview = app.get_webview("chaoxing").ok_or((
+            409,
+            json!({"error": "未找到 chaoxing Webview"}),
+        ))?;
+        let parsed: tauri::Url = topic_url
+            .parse()
+            .map_err(|error| (500, json!({"error": format!("URL 无效: {error}")})))?;
+        webview
+            .navigate(parsed)
+            .map_err(|error| (500, json!({"error": format!("跳转失败: {error}")})))?;
+    }
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+
+    let script = render_js(REPLY_TOPIC_JS, &chapter, &nonce, port, Some(&text));
+    {
+        let webview = app.get_webview("chaoxing").ok_or((
+            409,
+            json!({"error": "未找到 chaoxing Webview"}),
+        ))?;
+        webview
+            .eval(&script)
+            .map_err(|error| (500, json!({"error": format!("执行脚本失败: {error}")})))?;
+    }
+    let reply = wait_report(app, "reply", &chapter, 40).await?;
+    log::info!(
+        "讨论回帖完成：章节 {chapter}，结果 {}",
+        if reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            "成功"
+        } else {
+            "未确认"
+        }
+    );
+    Ok(json!({
+        "ok": true,
+        "chapterId": chapter,
+        "question": question,
+        "topicUrl": topic_url,
+        "filled": reply.get("filled").cloned().unwrap_or(Value::Bool(false)),
+        "clicked": reply.get("clicked").cloned().unwrap_or(Value::Bool(false)),
+        "confirmed": reply.get("ok").cloned().unwrap_or(Value::Bool(false)),
+    }))
+}
+
+fn tail_lines(path: &std::path::Path, count: usize) -> std::io::Result<Vec<String>> {    let content = std::fs::read_to_string(path)?;
     let mut lines: Vec<String> = content.lines().map(|line| line.to_owned()).collect();
     if lines.len() > count {
         lines.drain(..lines.len() - count);
@@ -502,6 +740,7 @@ async fn route(
                     "POST /reload": "重载 chaoxing 当前页面",
                     "POST /navigate": "跳转 {\"url\": \"...\"}",
                     "POST /eval": "在 chaoxing 页面执行 {\"js\": \"...\"}",
+                    "POST /discuss": "自动完成讨论任务点 {\"courseId\",\"clazzId\",\"cpi\",\"enc\",\"chapterId\",\"text\",\"dryRun\"}",
                     "POST /solve": "解题 {\"payload\": Folio, \"allowPartial\": false}",
                     "GET /autoconfirm": "查看确认策略",
                     "POST /autoconfirm": "设置确认策略 {\"mode\": \"yes|no|ask\"}，持久生效",
@@ -518,6 +757,17 @@ async fn route(
 
     if path == "/status" && request.method == "GET" {
         return Ok((200, status_value(app)));
+    }
+
+    if path == "/report" && request.method == "POST" {
+        let value: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        app.state::<ControlState>().set_report(value);
+        return Ok((200, json!({"ok": true})));
+    }
+
+    if path == "/discuss" && request.method == "POST" {
+        let body = json_body(&request.body)?;
+        return discuss_topic(app, body).await.map(|value| (200, value));
     }
 
     if path == "/logs" && request.method == "GET" {
@@ -639,7 +889,14 @@ async fn route(
 
 async fn handle(mut stream: TcpStream, app: AppHandle, token: String) -> std::io::Result<()> {
     let request = read_request(&mut stream).await?;
-    if !authorized(&request.headers, &token) {
+    // `/report` 由页面侧 sendBeacon 回传（无法附加自定义头），改用一次性口令校验。
+    let report_ok = request.path == "/report"
+        && request.method == "POST"
+        && request
+            .query
+            .get("nonce")
+            .is_some_and(|nonce| nonce == &app.state::<ControlState>().report_nonce());
+    if !report_ok && !authorized(&request.headers, &token) {
         return respond(&mut stream, 401, &json!({"error": "令牌无效或缺失"})).await;
     }
     // OPTIONS 预检直接放行，方便浏览器/网页侧调试。

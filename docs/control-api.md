@@ -34,8 +34,35 @@ token = "<32 位十六进制随机令牌>"
 | POST | `/reload` | 重载 chaoxing 当前页面 |
 | POST | `/navigate` | `{"url": "..."}` 跳转 |
 | POST | `/eval` | `{"js": "..."}` 在 chaoxing 页面执行脚本 |
+| POST | `/discuss` | 自动完成一个“思考讨论”任务点（见下） |
 | POST | `/solve` | `{"payload": <Folio>, "allowPartial": false}` 调答题内核 |
 | GET | `/logs?lines=100` | 最新日志尾部 |
+
+### `/discuss`：讨论任务点自动回帖
+
+上游脚本只认视频/测验，遇到“思考讨论”会打印 `未识别的任务点类型 insertbbs` 并跳过。
+这条链路无法用课程页的发帖接口（`/mooc-ans/bbscircle/grouptopic/publish` 返回 `error, code=4`），
+必须走 `groupweb.chaoxing.com` 的话题页回帖，所以单独做成本地接口：
+
+1. 打开 `studentstudy?chapterId=...` 章节页；
+2. 在嵌套 iframe（`#iframe > iframe > #frame_content`）里读 `#topicMainDiv` 的 `data` 属性拿到话题地址；
+3. 跳转话题页，填 `textarea[placeholder='回复话题']` 并点 `.addReply`。
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"courseId":"265759812","clazzId":"151527283","cpi":"496242403",
+       "enc":"<章节页隐藏 enc>","chapterId":"1207300142",
+       "text":"回帖内容","dryRun":false}' \
+  http://127.0.0.1:8765/discuss
+```
+
+- `dryRun: true` 只取话题地址与题干并返回，不提交（用于核对任务点类型）。
+- 返回 `{ok, chapterId, question, topicUrl, filled, clicked, confirmed}`；
+  `confirmed` 表示话题页已出现本账号新楼层。
+- 页面侧结果通过 `POST /report?nonce=<一次性口令>` 经 `sendBeacon` 回传（该路径只认口令、不认令牌，
+  因为 beacon 无法带自定义头；口令每次调用重新生成，用完即废）。
+- 章节 `enc` 与 `chapterId` 仍需从课程章节页取（`div.posCatalog_select` 的 `onclick="toOld(...)"`
+  与页面隐藏 `#enc`），未内置爬取。
 
 `/start` 与 `/stop` 的机制：把页面重载，让注入脚本重新跑；同时把确认框策略临时设为
 "自动确认/自动取消"（15 秒后交还界面）。所以远程启动不需要有人点 Yes。
